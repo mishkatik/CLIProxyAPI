@@ -26,6 +26,11 @@ func claudeResetAuth(id string, weeklyReset, fiveHourReset time.Time) *Auth {
 	return &Auth{ID: id, Provider: "claude", Quota: QuotaState{ObservedAt: time.Now(), Signals: signals}}
 }
 
+func withOAuthMetadata(auth *Auth) *Auth {
+	auth.Metadata = map[string]any{"email": auth.ID + "@example.com"}
+	return auth
+}
+
 func TestSoonestResetSelectorPick_PrefersSoonestWeeklyReset(t *testing.T) {
 	t.Parallel()
 
@@ -146,6 +151,62 @@ func TestSoonestResetSelectorPick_SkipsCredentialQuotaCooldown(t *testing.T) {
 	}
 }
 
+func TestSoonestResetSelectorPick_ProbesUnobservedOAuthCredential(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	selector := &SoonestResetSelector{}
+	observed := withOAuthMetadata(claudeResetAuth("a", now.Add(2*24*time.Hour), now.Add(time.Hour)))
+	added := withOAuthMetadata(&Auth{ID: "b", Provider: "claude"})
+
+	got, err := selector.Pick(context.Background(), "claude", "", cliproxyexecutor.Options{}, []*Auth{observed, added})
+	if err != nil {
+		t.Fatalf("Pick() error = %v", err)
+	}
+	if got == nil || got.ID != "b" {
+		t.Fatalf("Pick() auth = %v, want b", got)
+	}
+}
+
+func TestSoonestResetSelectorPick_RotatesAmongUnobservedOAuthCredentials(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	selector := &SoonestResetSelector{}
+	auths := []*Auth{
+		withOAuthMetadata(claudeResetAuth("a", now.Add(time.Hour), time.Time{})),
+		withOAuthMetadata(&Auth{ID: "b", Provider: "claude"}),
+		withOAuthMetadata(claudeResetAuth("c", now.Add(-time.Hour), now.Add(-2*time.Hour))),
+	}
+
+	for i, want := range []string{"b", "c", "b"} {
+		got, err := selector.Pick(context.Background(), "claude", "", cliproxyexecutor.Options{}, auths)
+		if err != nil {
+			t.Fatalf("Pick() #%d error = %v", i, err)
+		}
+		if got == nil || got.ID != want {
+			t.Fatalf("Pick() #%d auth = %v, want %s", i, got, want)
+		}
+	}
+}
+
+func TestSoonestResetSelectorPick_DoesNotProbeAPIKeyCredential(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	selector := &SoonestResetSelector{}
+	subscription := withOAuthMetadata(claudeResetAuth("a", now.Add(6*24*time.Hour), time.Time{}))
+	apiKey := &Auth{ID: "b", Provider: "claude", Attributes: map[string]string{AttributeAPIKey: "sk-test"}}
+
+	got, err := selector.Pick(context.Background(), "claude", "", cliproxyexecutor.Options{}, []*Auth{subscription, apiKey})
+	if err != nil {
+		t.Fatalf("Pick() error = %v", err)
+	}
+	if got == nil || got.ID != "a" {
+		t.Fatalf("Pick() auth = %v, want a", got)
+	}
+}
+
 func TestQuotaResetKeyForAuth_CodexUsesLongerWindow(t *testing.T) {
 	t.Parallel()
 
@@ -224,5 +285,53 @@ func TestManagerSoonestResetSelectsObservedSoonestReset(t *testing.T) {
 		if selected == nil || selected.ID != "soonest-reset-auth-b" {
 			t.Fatalf("SelectAuth() #%d auth = %v, want soonest-reset-auth-b", i, selected)
 		}
+	}
+}
+
+func TestManagerSoonestResetProbesCredentialAddedAfterObservation(t *testing.T) {
+	t.Parallel()
+
+	manager := NewManager(nil, &SoonestResetSelector{}, nil)
+	manager.RegisterExecutor(schedulerTestExecutor{provider: "claude"})
+	model := "soonest-reset-probe-test-model"
+	observedID, addedID := "soonest-reset-probe-auth-a", "soonest-reset-probe-auth-b"
+	registerSchedulerModels(t, "claude", model, observedID, addedID)
+
+	now := time.Now()
+	observe := func(id string, weeklyReset time.Time) {
+		t.Helper()
+		ctx := internallogging.WithResponseHeadersHolder(context.Background())
+		internallogging.SetResponseHeaders(ctx, http.Header{
+			"Anthropic-Ratelimit-Unified-7d-Reset": []string{unixSignal(weeklyReset)},
+			"Anthropic-Ratelimit-Unified-5h-Reset": []string{unixSignal(now.Add(time.Hour))},
+		})
+		manager.MarkResult(ctx, Result{AuthID: id, Provider: "claude", Model: model, Success: true})
+	}
+	selectID := func() string {
+		t.Helper()
+		selected, errSelect := manager.SelectAuth(context.Background(), "claude", model, cliproxyexecutor.Options{})
+		if errSelect != nil {
+			t.Fatalf("SelectAuth() error = %v", errSelect)
+		}
+		if selected == nil {
+			t.Fatal("SelectAuth() returned nil auth")
+		}
+		return selected.ID
+	}
+
+	if _, errRegister := manager.Register(context.Background(), withOAuthMetadata(&Auth{ID: observedID, Provider: "claude"})); errRegister != nil {
+		t.Fatalf("Register(%s) error = %v", observedID, errRegister)
+	}
+	observe(observedID, now.Add(2*24*time.Hour))
+	if _, errRegister := manager.Register(context.Background(), withOAuthMetadata(&Auth{ID: addedID, Provider: "claude"})); errRegister != nil {
+		t.Fatalf("Register(%s) error = %v", addedID, errRegister)
+	}
+
+	if got := selectID(); got != addedID {
+		t.Fatalf("SelectAuth() before probe = %s, want %s", got, addedID)
+	}
+	observe(addedID, now.Add(5*24*time.Hour))
+	if got := selectID(); got != observedID {
+		t.Fatalf("SelectAuth() after probe = %s, want %s", got, observedID)
 	}
 }

@@ -21,9 +21,14 @@ const (
 // credential closest to its reset first keeps the quota of the other credentials for later.
 // Credentials are ranked by the reset of their long (weekly) window and then by the reset of
 // their short (5h) window, read from the passive quota snapshot in Auth.Quota.Signals.
-// Claude and Codex credentials report these watermarks. When no candidate carries a future
-// reset time, for example other providers or credentials not used since startup, the
-// selector falls back to round-robin.
+// Claude and Codex credentials report these watermarks.
+//
+// A Claude or Codex OAuth credential without a future reset (unused since startup, or every
+// window already passed) is picked first, round-robin among such credentials, because one
+// response reveals its windows. Otherwise a credential added after the others were observed
+// would never be picked and its expiring quota would be lost. Other credentials without a
+// known reset (API keys, other providers) rank after known resets, and the selector falls
+// back to round-robin when no candidate carries a future reset time.
 type SoonestResetSelector struct {
 	fallback RoundRobinSelector
 }
@@ -69,9 +74,13 @@ func (s *SoonestResetSelector) Pick(ctx context.Context, provider, model string,
 
 	var best *Auth
 	var bestKey quotaResetKey
+	var unobserved []*Auth
 	for _, auth := range available {
 		key := quotaResetKeyForAuth(auth, now)
 		if !key.known() {
+			if reportsQuotaResets(auth) {
+				unobserved = append(unobserved, auth)
+			}
 			continue
 		}
 		if best == nil || key.before(bestKey) {
@@ -79,10 +88,24 @@ func (s *SoonestResetSelector) Pick(ctx context.Context, provider, model string,
 			bestKey = key
 		}
 	}
+	if len(unobserved) > 0 {
+		return s.fallback.Pick(ctx, provider, model, opts, unobserved)
+	}
 	if best != nil {
 		return best, nil
 	}
 	return s.fallback.Pick(ctx, provider, model, opts, available)
+}
+
+// reportsQuotaResets reports whether a response for auth carries subscription window resets.
+// API-key credentials are billed per token and report no windows, so they are never probed.
+func reportsQuotaResets(auth *Auth) bool {
+	switch strings.ToLower(strings.TrimSpace(auth.Provider)) {
+	case "claude", "codex":
+		return auth.AuthKind() == AuthKindOAuth
+	default:
+		return false
+	}
 }
 
 func quotaResetKeyForAuth(auth *Auth, now time.Time) quotaResetKey {
